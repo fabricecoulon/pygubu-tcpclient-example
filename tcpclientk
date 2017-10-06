@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import filedialog
+import platform
+import sys
+import os
+import pygubu
+from pygubu.builder import ttkstdwidgets
+import logging
+import time
+import threading
+import queue
+import configparser
+
+# Import local tcpclientk modules
+from tcpclientk_tcp import TcpClientSock, TcpClientTxThread, TcpClientRxThread, TcpClientThread
+from tcpclientk_helpers import write_to_textwidget
+
+__version__  = '1.0.0'
+
+# Use logging.DEBUG for debugging
+DEFAULT_LOGLVL = logging.INFO
+#DEFAULT_LOGLVL = logging.DEBUG
+
+#Initialize loggers
+root = logging.getLogger()
+root.setLevel(DEFAULT_LOGLVL)
+# Root logger emits everything on stdout
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(DEFAULT_LOGLVL)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+root.addHandler(ch)
+# This module logger emits in the UI's status bar and stdout
+logger = logging.getLogger(__name__)
+
+FILE_PATH = None  # To be set in __main__
+
+PREFFILE_DIR = ".tcpclientk"
+PREFFILE = "tcpclientk.ini"
+DEF_IP = "127.0.0.1"
+DEF_PORT = 8090
+# New line character choice:
+# _win_ = CRLF 0x0d 0x0a, _linux_ = LF 0x0a or '\n', _mac_ = CR 0x0d
+DEF_NL = '\n'
+# Client Mode: send on _enter_, send on _keypressed_
+SEND_ON_ENTER = 0
+SEND_ON_KEYPRESSED = 1
+DEF_CLIENT_MODE = SEND_ON_ENTER
+
+class StatusBarHandler(logging.Handler):
+    def __init__(self, tklabel, level=logging.NOTSET):
+        super(StatusBarHandler, self).__init__(level)
+        self.tklabel = tklabel
+        self._clear = True
+        self._cb_id = None
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if not self._clear and self._cb_id is not None:
+                self.tklabel.after_cancel(self._cb_id)
+            self._clear = False
+            self._cb_id = self.tklabel.after(10000, self.clear)
+            txtcolor = 'red'
+            if record.levelno == logging.INFO:
+                txtcolor = 'black'
+            self.tklabel.configure(text=msg, foreground=txtcolor)
+            self.tklabel.update()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
+
+    def clear(self):
+        self.tklabel.configure(text='', foreground='black')
+        self._clear = True
+
+
+class TcpClientkUI(pygubu.TkApplication):
+    """Main gui class"""
+
+    def __init__(self, root, config):
+        self.config = config
+        super().__init__(root)
+
+    def _init_before(self):
+        pass
+
+    def _create_ui(self):
+        """Creates all gui widgets"""
+        self.about_dialog = None
+        self.preferences = None
+        self.builder = pygubu.Builder()
+        uifile = os.path.join(FILE_PATH, "tcpclientk.ui")
+        self.builder.add_from_file(uifile)
+
+        #build main ui
+        self.builder.get_object('mainwindow', self.master)
+        toplevel = self.master.winfo_toplevel()
+        menu = self.builder.get_object('mainmenu', toplevel)
+        toplevel['menu'] = menu
+
+        #Queue for thread-safe communications (only tkinter mainloop
+        #can call tkinter's own functions like e.g widget's update()
+        self._queue = queue.Queue()
+        self.master.after(1000, self.queue_check)
+
+        #command input
+        self.label_command = self.builder.get_object('label_cmd')
+        self.command_input = self.builder.get_object('command_input')
+
+        if (self.config['LASTSESSION']['client_mode'] == 'enter'):
+            self.client_mode = SEND_ON_ENTER
+        elif (self.config['LASTSESSION']['client_mode'] == 'keypress'):
+            self.client_mode = SEND_ON_KEYPRESSED
+        else:
+            raise Exception("Unkown client mode: %s" % self.config['LASTSESSION']['client_mode'])
+
+        if self.client_mode == SEND_ON_KEYPRESSED:
+            # Bind ANY key to command input entry
+            self.command_input.bind('<Key>', self.on_command_input_anykey)
+        elif self.client_mode == SEND_ON_ENTER:
+            # Bind return/enter key to command input entry
+            self.command_input.bind('<Return>', self.on_command_input_enter)
+
+        #textbox (tk.Text) that we will fillin with the data received
+        self.data_read_widget = self.builder.get_object('data_read')
+        self.data_read_widget.config(state='disabled')
+        self.data_read_widget.update()
+
+        # Create a Vertical Scrollbar and associate it with data_read_widget above
+        yscrollb = tk.Scrollbar(self.builder.get_object('middle_frame'), command=self.data_read_widget.yview)
+        yscrollb.grid(row=0, column=1, sticky='nsew')
+        self.data_read_widget['yscrollcommand'] = yscrollb.set
+
+        #Status bar
+        self.statusbar = self.builder.get_object('statusbar')
+        handler = StatusBarHandler(self.statusbar)
+        #handler.setLevel(logging.WARNING)
+        handler.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        # The status update thread
+        self._status_update_t = None
+        self._status_update_t_do_exit = False
+
+        #app grid
+        self.set_resizable()
+
+        #This is important to wire the callbacks from,
+        # as example: the menu "on_help_menuitem_clicked", etc.
+        self.builder.connect_callbacks(self)
+
+        #app config
+        top = self.master.winfo_toplevel()
+        top.wm_iconname('tcpclientk')
+        _icon = os.path.join(FILE_PATH, "tcpclientk")
+        img = None
+        if os.path.exists(_icon + '.gif'):
+            img = tk.Image("photo", file=_icon+'.gif')
+        elif os.path.exists(_icon + '.png'):
+            img = tk.Image("photo", file=_icon+'.png')
+
+        if img:
+            top.tk.call('wm', 'iconphoto', '.', img)
+
+        self.set_title("tcpclientk - A TCP client for simple line-based communication")
+        self.set_size('640x480')
+
+        #
+        #Application bindings
+        #
+        self.master.bind_all(
+            '<Control-KeyPress-o>',
+            lambda e: self.on_file_menuitem_clicked('file_open'))
+        self.master.bind_all(
+            '<Control-KeyPress-s>',
+            lambda e: self.on_file_menuitem_clicked('file_save'))
+        self.master.bind_all(
+            '<Control-KeyPress-q>',
+            lambda e: self.on_file_menuitem_clicked('file_quit'))
+
+        # Create and start the background threads
+        self.ip = self.config['LASTSESSION']['ip']
+        self.port = int(self.config['LASTSESSION']['port'])
+        self._thread_list = []
+        self._create_bg_threads()
+        # Some extra properties
+        if (self.config['LASTSESSION']['nl'] == 'linux'):
+            self.nl = '\n'
+        elif (self.config['LASTSESSION']['nl'] == 'win'):
+            self.nl = '\r\n'
+        elif (self.config['LASTSESSION']['nl'] == 'mac'):
+            self.nl = '\r'
+        else:
+            raise Exception("Unknown newline type: %s" % self.config['LASTSESSION']['nl'])
+
+    def _create_bg_threads(self):
+        # Create a socket
+        self.tcp_client = TcpClientSock(self.ip, self.port)
+
+        client_args={'ip': self.ip,
+                'port': self.port,
+                'tcp_client': self.tcp_client,
+                'msg_queue': self._queue
+                }
+
+        # thread for sending data
+        self._tcp_tx_t = TcpClientTxThread(args=(0,), kwargs=client_args)
+        self._thread_list.append(self._tcp_tx_t)
+        self._tcp_tx_t.start()
+
+        # thread for receiving data
+        self._tcp_rx_t = TcpClientRxThread(args=(0,), kwargs=client_args)
+        self._thread_list.append(self._tcp_rx_t)
+        self._tcp_rx_t.start()
+
+        # thread for status feedback to the user (create only once)
+        if self._status_update_t is None:
+            self._status_update_t = threading.Thread(name='status_update_t', target=self._status_update_task)
+            self._thread_list.append(self._status_update_t)
+            self._status_update_t.start()
+
+    def queue_check(self):
+        while self._queue.qsize() > 0:
+            try:
+                data = self._queue.get()  # non-blocking
+            except queue.Empty:
+                pass
+
+            if len(data) > 0:
+                decoded = data.decode('ascii')
+                write_to_textwidget(self.data_read_widget, decoded)
+
+        self.master.after(100, self.queue_check)
+
+    def _destroy_bg_tcp_threads(self):
+        """ Destroy/force exit only the TcpClientThread instances """
+        logger.debug("_destroy_bg_tcp_threads in")
+        if self.tcp_client is not None:
+            self.tcp_client.disconnect()
+            self.tcp_client = None
+
+        self._tcp_tx_t = None
+        self._tcp_rx_t = None
+
+        for t in self._thread_list:
+            if isinstance(t, TcpClientThread):
+                t._do_exit = True
+
+        logger.debug("_destroy_bg_tcp_threads after _do_exit")
+
+        to_remove = []
+        for t in self._thread_list:
+            if isinstance(t, TcpClientThread):
+                logger.debug("_destroy_bg_tcp_threads before join %s" % t.name)
+                t.join(1.0)
+                to_remove.append(t)
+
+        for t in to_remove:
+            self._thread_list.remove(t)
+
+    # This is called when the user closes the window by clicking on "X"
+    def on_close_execute(self):
+        logger.info("Closing application now")
+        self._destroy_bg_tcp_threads()
+        self._status_update_t_do_exit = True
+        self._status_update_t.join(1.0)
+        logger.info("Exiting...")
+        return True
+
+    def _status_update_task(self):
+        last_status = 0
+        status = 0
+        sleep_x_second = 1
+        while not self._status_update_t_do_exit:
+            msg = None
+            last_status = status
+            if (self._tcp_tx_t is not None) and (not self._tcp_tx_t.tcp_client.connected):
+                self.command_input.configure(state='disabled')
+                self.command_input.update()
+                status = 0
+                msg = "NOT connected to %s:%s" % (self.ip, self.port)
+                if self._tcp_tx_t.tcp_client.last_error:
+                    msg += ": %s" % self._tcp_tx_t.tcp_client.last_error
+                logger.warn(msg)
+            elif (self._tcp_tx_t is not None) and (self._tcp_tx_t.tcp_client.connected):
+                status = 1
+                msg = "Connected to %s:%s" % (self.ip, self.port)
+                if status != last_status:
+                    self.command_input.configure(state='normal')
+                    self.command_input.update()
+                    logger.warn(msg)
+
+            time.sleep(sleep_x_second)
+
+        logger.debug("_status_update_task NOT running")
+
+    #Command input enter key event
+    def on_command_input_enter(self, event):
+        fromfile = False
+        ret = False
+        input_txt = self.command_input.get()
+        logger.debug("<Enter> key was pressed: %s" % input_txt)
+
+        # Check if we have to read from a file
+        if input_txt.startswith("#fromfile:"):
+            fromfile = True
+            fname = input_txt.replace("#fromfile:", '')
+            try:
+                with open(fname, 'r') as f:
+                    input_txt = f.read()
+            except OSError as e:
+                logger.error("Could not read from %s" % fname)
+                return
+
+        # Send the data
+        try:
+            if not fromfile:
+                ret = self._tcp_tx_t.send(input_txt + self.nl)
+            else:
+                ret = self._tcp_tx_t.send(input_txt)
+        except UnicodeEncodeError as e:
+            logger.error("Could not perform ASCII encoding of: %s" % input_txt)
+            return
+
+        if not ret:
+            logger.error("Could not send the data correctly")
+            return
+
+        # Update the widget with the data we are going to send
+        if not fromfile:
+            write_to_textwidget(self.data_read_widget, '> ' + input_txt + '\n')
+        else:
+            write_to_textwidget(self.data_read_widget, '> [' + input_txt + ']\n')
+
+    #Command input any key pressed
+    def on_command_input_anykey(self, key):
+        ret = False
+        if len(key.char) == 0:
+            # Nothing to send
+            return
+        logger.debug("A key was pressed: 0x%02x, %s" % (ord(key.char), key.char.encode('ascii')))
+        try:
+            ret = self._tcp_tx_t.send(key.char)
+        except UnicodeEncodeError as e:
+            logger.error("Could not perform ASCII encoding of: %s" % key.char)
+            return
+        if ord(key.char) == 0x0d:
+            # When pressing enter, clear the input text entry
+            self.command_input.delete(0, 'end')
+
+        if not ret:
+            logger.error("Could not send the character correctly")
+            return
+
+        _char = key.char
+
+        if ord(key.char) == 0x0d:
+            _char = 'NL'  # Replace '\r' with 'NL' in widget only for user feedback
+
+        if ord(key.char) == 0x08:
+            _char = 'BS'  # Replace '\b' with 'BS' in widget only for user feedback
+
+        # Update the widget with the data we are going to send
+        write_to_textwidget(self.data_read_widget, '> ' + _char  + '\n')
+
+    #File menu
+    def on_file_menuitem_clicked(self, itemid):
+        if itemid == 'file_open':
+            options = {
+                'defaultextension': '.cmd',
+                'filetypes': (('Commands', '*.cmd'), ('All', '*.*'))}
+            fname = filedialog.askopenfilename(**options)
+            if fname:
+                logger.debug("Read from this file: %s" % fname)
+                self.command_input.delete(0, tk.END)
+                self.command_input.insert(0, "#fromfile:" + fname)
+                self.command_input.update()
+        elif itemid == 'file_quit':
+            self.quit()
+
+    #Edit menu
+    def on_edit_menuitem_clicked(self, itemid):
+        pass
+
+    #Help menu
+    def on_help_menuitem_clicked(self, itemid):
+        if itemid == 'help_online':
+            url = 'https://github.com/fabricecoulon/pygubu-tcpclient-example'
+            webbrowser.open_new_tab(url)
+        elif itemid == 'help_about':
+            self.show_about_dialog()
+
+    def _create_about_dialog(self):
+        builder = pygubu.Builder()
+        uifile = os.path.join(FILE_PATH, "tcpclientk_about_dialog.ui")
+        builder.add_from_file(uifile)
+
+        dialog = builder.get_object(
+            'aboutdialog', self.master.winfo_toplevel())
+        entry = builder.get_object('version')
+        txt = entry.cget('text')
+        txt = txt.replace('%version%', str(__version__))
+        entry.configure(text=txt)
+
+        def on_ok_execute():
+            dialog.close()
+
+        builder.connect_callbacks({'on_ok_execute': on_ok_execute})
+
+        return dialog
+
+    def show_about_dialog(self):
+        if self.about_dialog is None:
+            self.about_dialog = self._create_about_dialog()
+            self.about_dialog.run()
+        else:
+            self.about_dialog.show()
+
+    #Connection menu
+    def on_connection_menuitem_clicked(self, itemid):
+        if itemid == "connection_disconnect":
+            if self.tcp_client.connected:
+                write_to_textwidget(self.data_read_widget, "(Disconnect)\n")
+            self.tcp_client.disconnect()
+        elif itemid == "connection_connect":
+            if not self.tcp_client.connected:
+                write_to_textwidget(self.data_read_widget, "(Connect)\n")
+                self._destroy_bg_tcp_threads()
+                self._create_bg_threads()
+
+
+def start_tcpclientk():
+    print("python version: {0} on {1}".format(
+                platform.python_version(), sys.platform))
+    print("pygubu version: {0}".format(pygubu.__version__))
+    # Get or create preference file
+    user_home_dir = os.getenv('HOME')
+    abs_path_pref_dir = os.path.join(user_home_dir, PREFFILE_DIR)
+    try:
+        if not os.path.exists(abs_path_pref_dir):
+            os.mkdir(abs_path_pref_dir)
+    except OSError as e:
+        logger.info("Could not create dir: %s, %s" % (abs_path_pref_dir, e))
+
+    config = configparser.ConfigParser()
+    abs_path_pref = os.path.join(abs_path_pref_dir, PREFFILE)
+    try:
+        f = open(abs_path_pref, 'r')
+        config.read_file(f)
+        f.close()
+    except FileNotFoundError as e:
+        # Not an error, use defaults if file not found
+        logger.info(e)
+    except Exception as e:
+        logger.error(e)
+
+    if 'LASTSESSION' in config:
+        logger.info("Using settings from config file...")
+    else:
+        logger.info("Using application default settings...")
+        config['LASTSESSION'] = {}
+        config['LASTSESSION']['ip'] = DEF_IP
+        config['LASTSESSION']['port'] = str(DEF_PORT)
+        if (DEF_NL == '\r\n'):
+            config['LASTSESSION']['nl'] = 'win'
+        elif (DEF_NL == '\n'):
+            config['LASTSESSION']['nl'] = 'linux'
+        elif (DEF_NL == '\r'):
+            config['LASTSESSION']['nl'] = 'mac'
+        config['LASTSESSION']['client_mode'] = ('enter' if (DEF_CLIENT_MODE == SEND_ON_ENTER) else 'keypressed')
+
+    for k in config['LASTSESSION']:
+        logger.info("%s = %s" % (k, config['LASTSESSION'][k]))
+
+    root = tk.Tk()
+    root.withdraw()
+    app = TcpClientkUI(root, config)
+    root.deiconify()
+    app.run()
+    try:
+        with open(abs_path_pref, 'w') as f:
+            config.write(f)
+    except Exception as e:
+        logger.error(e)
+
+if __name__ == '__main__':
+    frozen = '_NOT_'
+    if getattr(sys, 'frozen', False):
+        # we are running in a bundle (e.g. built with pyinstaller --onefile)
+        FILE_PATH = sys._MEIPASS
+    else:
+        # we are running in a normal Python environment
+        FILE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+    start_tcpclientk()
+    logger.debug("Exit mainthread now")
