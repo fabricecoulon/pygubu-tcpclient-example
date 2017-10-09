@@ -14,31 +14,36 @@ class TcpClientSock(object):
         self.ip = ip
         self.port = port
         self.connected = False
+        self.disconnected = False
         self.sock = None
         self.last_error = None
-        self.autoconnect = True
 
     def connect(self):
-        self.autoconnect = True
+        logger.debug("connect")
+        if self.disconnected:
+            return
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(DEFAULT_CONNECT_TIMEOUT)
             self.sock.connect((self.ip, self.port))
-        except socket.error as e:
+        except Exception as e:
+            if self.sock:
+                self.sock.close()
+                self.sock = None
             self.connected = False
             self.last_error = str(e)
-            logger.debug(self.last_error)
-            return
-        self.connected = True
-        self.last_error = None
+            logger.debug(e)
+        else:
+            self.connected = True
+            self.last_error = None
 
     def disconnect(self):
-        if not self.connected:
-            return
-        self.sock.close()
+        logger.debug("disconnect")
+        if self.sock:
+            self.sock.close()
         self.sock = None
         self.connected = False
-        self.autoconnect = False
+        self.disconnected = True
 
 
 class TcpClientThread(threading.Thread):
@@ -51,6 +56,7 @@ class TcpClientThread(threading.Thread):
         self._do_exit = False
         self.tcp_client = None
         self._queue = None
+        self.autoconnect = False
 
         self.ip = self.kwargs['ip']
         self.port = self.kwargs['port']
@@ -67,7 +73,7 @@ class TcpClientThread(threading.Thread):
 
         while not self._do_exit:
 
-            while (not self._do_exit) and (not self.tcp_client.connected) and self.tcp_client.autoconnect:
+            while (not self._do_exit) and (not self.tcp_client.connected) and self.autoconnect:
                 self.tcp_client.connect()
                 time.sleep(0.5)
 
@@ -81,6 +87,10 @@ class TcpClientThread(threading.Thread):
 
 
 class TcpClientTxThread(TcpClientThread):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.autoconnect = True
 
     def _run(self):
         time.sleep(1)
