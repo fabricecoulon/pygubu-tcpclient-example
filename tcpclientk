@@ -112,7 +112,7 @@ class TcpClientkUI(pygubu.TkApplication):
 
         if (self.config['LASTSESSION']['client_mode'] == 'enter'):
             self.client_mode = SEND_ON_ENTER
-        elif (self.config['LASTSESSION']['client_mode'] == 'keypress'):
+        elif (self.config['LASTSESSION']['client_mode'] == 'keypressed'):
             self.client_mode = SEND_ON_KEYPRESSED
         else:
             raise Exception("Unkown client mode: %s" % self.config['LASTSESSION']['client_mode'])
@@ -342,7 +342,12 @@ class TcpClientkUI(pygubu.TkApplication):
             return
         logger.debug("A key was pressed: 0x%02x, %s" % (ord(key.char), key.char.encode('ascii')))
         try:
-            ret = self._tcp_tx_t.send(key.char)
+            if ord(key.char) != 0x0d:
+                # Send the character
+                ret = self._tcp_tx_t.send(key.char)
+            else:
+                # User pressed ENTER, send a NL character
+                ret = self._tcp_tx_t.send(self.nl)
         except UnicodeEncodeError as e:
             logger.error("Could not perform ASCII encoding of: %s" % key.char)
             return
