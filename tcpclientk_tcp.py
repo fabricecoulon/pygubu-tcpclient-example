@@ -97,10 +97,13 @@ class TcpClientTxThread(TcpClientThread):
         return True
 
     def send(self, data):
-        if not isinstance(data, str):
-            raise Exception("You must pass a string to send()")
+        if (not isinstance(data, str)) and (not isinstance(data, bytes)):
+            raise Exception("You must pass a str or bytes to send() not a %s" % type(data))
 
-        data_ascii_encoded = data.encode('ascii')
+        if isinstance(data, str):
+            data_ascii_encoded = data.encode('ascii')
+        elif isinstance(data, bytes):
+            data_ascii_encoded = data
 
         if not self.tcp_client.connected:
             logger.debug('Could not send data: %s' % data_ascii_encoded)
