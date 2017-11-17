@@ -6,6 +6,7 @@ import time
 DEFAULT_CONNECT_TIMEOUT = 10.0  # seconds
 DEFAULT_RECV_TIMEOUT = 1.0
 DEFAULT_RECV_BUFLEN = 1024
+DEFAULT_SEND_TIMEOUT = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,8 @@ class TcpClientTxThread(TcpClientThread):
         time.sleep(1)
         return True
 
-    def send(self, data):
+    def send(self, data, sendall=False):
+        bytes_sent = -1
         if (not isinstance(data, str)) and (not isinstance(data, bytes)):
             raise Exception("You must pass a str or bytes to send() not a %s" % type(data))
 
@@ -107,15 +109,29 @@ class TcpClientTxThread(TcpClientThread):
 
         if not self.tcp_client.connected:
             logger.debug('Could not send data: %s' % data_ascii_encoded)
-            return False
+            return (False, bytes_sent)
         logger.debug('Sending data: %s' % data_ascii_encoded)
 
         try:
-            self.tcp_client.sock.send(data_ascii_encoded)
-        except BrokenPipeError as e:
+            self.tcp_client.sock.settimeout(DEFAULT_SEND_TIMEOUT)
+            if not sendall:
+                bytes_sent = self.tcp_client.sock.send(data_ascii_encoded)
+            else:
+                self.tcp_client.sock.sendall(data_ascii_encoded)
+                bytes_sent = len(data_ascii_encoded)
+
+        except socket.timeout as e:
+            logger.error(e)
+            return (False, bytes_sent)
+        except (BrokenPipeError, socket.error) as e:
+            # The connection is gone?
             self.tcp_client.connected = False
-            return False
-        return True
+            return (False, bytes_sent)
+
+        return (True, bytes_sent)
+
+    def sendall(self, data):
+        return self.send(data, sendall=True)
 
 
 class TcpClientRxThread(TcpClientThread):

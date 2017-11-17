@@ -328,12 +328,15 @@ class TcpClientkUI(pygubu.TkApplication):
         # Send the data
         if not fromfile:
             try:
-                ret = self._tcp_tx_t.send(input_data + self.nl)
+                ret, bytes_sent = self._tcp_tx_t.send(input_data + self.nl)
             except UnicodeEncodeError as e:
                 logger.error("Could not perform ASCII encoding of: %s" % input_data)
                 return
         else:
-            ret = self._tcp_tx_t.send(input_data)
+            # use sendall when sending a lot of data (e.g len > 1024 bytes)
+            ret, bytes_sent = self._tcp_tx_t.sendall(input_data)
+
+        logger.debug("bytes_sent = %lu" % bytes_sent)
 
         if not ret:
             logger.error("Could not send the data correctly")
@@ -342,8 +345,11 @@ class TcpClientkUI(pygubu.TkApplication):
         # Update the widget with the data we are going to send
         if not fromfile:
             write_to_textwidget(self.data_read_widget, '> ' + input_data + '\n')
+            # We have to count the additional NL
+            assert (len(input_data)+1) == bytes_sent, "%d != %d" % (len(input_data)+1, bytes_sent)
         else:
-            write_to_textwidget(self.data_read_widget, '> [' + input_data.decode('ascii') + ']\n')
+            write_to_textwidget(self.data_read_widget, '> [' + input_data.decode('ascii') + '] len=%lu\n' % len(input_data))
+            assert len(input_data) == bytes_sent, "%d != %d" % (len(input_data), bytes_sent)
             # clear the input text entry when reading from a file
             self.command_input.delete(0, 'end')
 
@@ -358,7 +364,7 @@ class TcpClientkUI(pygubu.TkApplication):
         try:
             if ord(key.char) != 0x0d:
                 # Send the character
-                ret = self._tcp_tx_t.send(key.char)
+                ret, _ = self._tcp_tx_t.send(key.char)
             else:
                 # User pressed ENTER
                 # Check if we have to read from a file
@@ -367,14 +373,14 @@ class TcpClientkUI(pygubu.TkApplication):
                     return
 
                 if not fromfile:
-                    ret = self._tcp_tx_t.send(self.nl)
+                    ret, _ = self._tcp_tx_t.send(self.nl)
                 else:
                     # Because TCP is a stream, calling send() one character at a time does _not_
                     # mean that the data will be transmitted one character at a time.
                     # input_data is a 'bytes' class because we use 'rb' in read() above
                     # we need to pass send a str or a bytes but iterating gives us a int
                     for c in input_data:
-                        ret = self._tcp_tx_t.send(bytes([c]))
+                        ret, _ = self._tcp_tx_t.send(bytes([c]))
         except UnicodeEncodeError as e:
             logger.error("Could not perform ASCII encoding of: %s" % key.char)
             return
