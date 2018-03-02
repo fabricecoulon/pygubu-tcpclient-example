@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+import sys
+import socketserver
+import logging
+import time
+import threading
+import signal
+
+try:
+    import hexdump
+except ImportError:
+    print("hexdump module not found. Try a pip install hexdump")
+    sys.exit(1)
+
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(name)s: %(message)s',
+                    )
+
+#CR = b'\r' # 0x0D
+LF = b'\n' # 0x0A
+#CRLF = b'\r\n' # 0x0D 0x0A
+BS = 0x08
+
+class EchoServerRequestHandler(socketserver.BaseRequestHandler):
+    """
+    The request handler class for our server.
+
+    It is instantiated once per connection to the server, and must
+    override the handle() method to implement communication to the
+    client.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        socketserver.BaseRequestHandler.__init__(self, *args, **kwargs)
+
+    def handle(self):
+        self.cmdbuffer = bytearray()
+        # self.request is the TCP socket connected to the client
+        while 1:
+            hasnl = False
+
+            # FYI bytes object are read only (no item assignment self.data[i]=val not possible)
+            try:
+                self.data = self.request.recv(1024)
+            except ConnectionResetError as e:
+                self.logger.error(e)
+                return
+
+            # but bytearray are not readonly, so we convert the data to a bytearray
+            self.data_as_bytearray = bytearray(self.data)
+
+            if len(self.data_as_bytearray) == 0:
+                return
+
+            self.logger.info("size: %d" % len(self.data_as_bytearray))
+            # We print the bytes object (which is identical at this point)
+            hexdump.hexdump(self.data)
+
+            self.cmdbuffer += self.data_as_bytearray
+
+            if LF in self.cmdbuffer:
+                hasnl = True
+
+            if not hasnl:
+                continue  # while loop
+
+            self.logger.info("concatenated raw input: %s" % self.cmdbuffer)
+            # allocate and set to zeros a bytearray as least as big as the original
+            self.cmdbuffer_nobs = bytearray(len(self.cmdbuffer))
+            j = 0
+            for i,v in enumerate(self.cmdbuffer):
+                if v != 0x08:
+                    self.cmdbuffer_nobs[j] = self.cmdbuffer[i]
+                    j += 1
+                elif (v == 0x08) and (j > 0):
+                    # set the current to zero and go backwards one character
+                    self.cmdbuffer_nobs[j] = 0x0
+                    j -= 1
+            _data = bytes(self.cmdbuffer_nobs)
+            self.logger.info("after processing: %s" % _data)
+            # Echo back the data to the client (That's what an echo server does...)
+            # make sure we only send one newline character back
+            _data = _data.replace(b'\x00', b'')  # Remove all NULL characters
+            self.request.send(_data)
+            del self.cmdbuffer[:]
+
+class EchoServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """
+    The Echo server class
+    To better understand the innerworkings of the TCPServer class
+    Inspired from https://pymotw.com/3/socketserver/, some calls have
+    been replaced with the super() call available since Python 3
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.debug('__init__')
+        super().__init__(*args, **kwargs)
+        return
+
+    def server_activate(self):
+        self.logger.debug('server_activate')
+        super().server_activate()
+        return
+
+    def serve_forever(self, **kwargs):
+        self.logger.debug('waiting for request')
+        self.logger.info(
+            'Handling requests, press <Ctrl-C> to quit'
+        )
+        super().serve_forever(**kwargs)
+        return
+
+    def handle_request(self):
+        self.logger.debug('handle_request')
+        return super().handle_request()
+
+    def verify_request(self, request, client_address):
+        self.logger.debug('verify_request(%s, %s)',
+                          request, client_address)
+        return super().verify_request(request, client_address)
+
+    def process_request(self, request, client_address):
+        self.logger.debug('process_request(%s, %s)',
+                          request, client_address)
+        return super().process_request(request, client_address)
+
+    def server_close(self):
+        self.logger.debug('server_close')
+        return super().server_close()
+
+    def finish_request(self, request, client_address):
+        self.logger.debug('finish_request(%s, %s)',
+                          request, client_address)
+        return super().finish_request(request, client_address)
+
+    def close_request(self, request_address):
+        self.logger.debug('close_request(%s)', request_address)
+        return super().close_request(request_address)
+
+    def shutdown(self):
+        self.logger.debug('shutdown()')
+        return super().shutdown()
+
+def usage():
+    print("Usage:\ntcpserver <ip> <port>\ntcpserver <ip>:<port>")
+
+if __name__ == "__main__":
+
+    try:
+        if (len(sys.argv) == 3):
+                HOST, PORT = sys.argv[1], int(sys.argv[2])
+        elif (len(sys.argv) == 2):
+                HOST, PORT = sys.argv[1].split(':')
+                PORT = int(PORT)
+        else:
+            HOST = '127.0.0.1'
+            PORT = 9999
+    except:
+        usage()
+        sys.exit(1)
+
+    #setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # is done by:
+    socketserver.TCPServer.allow_reuse_address = True
+
+    print("tcpserver running on %s:%d, press <CTRL>-C to exit" % (HOST, PORT))
+
+    # Create the server, binding to HOST on port PORT
+    server = EchoServer((HOST, PORT), EchoServerRequestHandler)
+    server.serve_forever()
+
